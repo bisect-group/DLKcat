@@ -1,0 +1,30 @@
+# Build or reuse the paper-setting DLKcat feature cache.
+conda run -n mldb python emulator_bench/cache_embeddings.py \
+  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
+  --hparams_json emulator_bench/default_hparams_paper.json
+
+# Train one split on cuda:0.
+conda run -n mldb python emulator_bench/train_single_target_tvt.py \
+  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
+  --hparams_json emulator_bench/default_hparams_paper.json \
+  --split_group random_splits_grouped_sequence \
+  --device cuda:0
+
+# Retrain all requested split jobs in parallel using paper settings.
+conda run -n mldb python emulator_bench/launch_parallel_retrain.py \
+  --gpus 0 \
+  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
+  --hparams_json emulator_bench/default_hparams_paper.json \
+  --trials_per_gpu 3
+  --seeds 666 777 888
+
+# Optional Optuna tuning.
+conda run -n mldb python emulator_bench/tune_optuna.py \
+  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
+  --split_groups random_splits_grouped_sequence random_splits_grouped_smiles \
+  --device cuda:0 \
+  --n_trials 20
+
+# Aggregate paper-setting retrain outputs.
+conda run -n mldb python emulator_bench/aggregate_dlkcat_results.py \
+  --root /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat/retrain_paper_settings

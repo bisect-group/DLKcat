@@ -1,0 +1,19 @@
+{
+  "radius": 2,
+  "ngram": 3,
+  "dim": 20,
+  "layer_gnn": 3,
+  "window": 11,
+  "layer_cnn": 3,
+  "layer_output": 3,
+  "lr": 0.001,
+  "lr_decay": 0.5,
+  "decay_interval": 10,
+  "weight_decay": 0.000001,
+  "epochs": 50,
+  "batch_size": 128,
+  "monitor_metric": "rmse",
+  "val_every": 1,
+  "patience": 0,
+  "clip_grad": 0.0
+}
