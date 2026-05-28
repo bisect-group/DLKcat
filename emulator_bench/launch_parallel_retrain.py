@@ -170,7 +170,7 @@ def run_parallel(args, experiments):
 
     threads = []
     for gpu_id in args.gpus:
-        for slot in range(args.trials_per_gpu):
+        for slot in range(args.runs_per_gpu):
             thread = threading.Thread(target=worker, args=(gpu_id, slot), daemon=True)
             thread.start()
             threads.append(thread)
@@ -201,7 +201,14 @@ def summarize(output_root: Path, results):
 def main():
     parser = argparse.ArgumentParser(description="Retrain DLKcat split jobs in parallel using paper/default settings.")
     parser.add_argument("--gpus", nargs="+", required=True)
-    parser.add_argument("--trials_per_gpu", type=int, default=1)
+    parser.add_argument(
+        "--runs_per_gpu",
+        "--trials_per_gpu",
+        dest="runs_per_gpu",
+        type=int,
+        default=1,
+        help="Number of concurrent retrain worker processes to run per GPU.",
+    )
     parser.add_argument("--base_dir", type=str, default=str(DEFAULT_BASE_DIR))
     parser.add_argument("--embeddings_dir", type=str, default=None)
     parser.add_argument("--hparams_json", type=str, default=str(DEFAULT_HPARAMS_PATH))
@@ -226,8 +233,8 @@ def main():
     parser.add_argument("--epochs", type=int, default=None)
     args = parser.parse_args()
 
-    if args.trials_per_gpu <= 0:
-        raise ValueError("--trials_per_gpu must be positive")
+    if args.runs_per_gpu <= 0:
+        raise ValueError("--runs_per_gpu must be positive")
     args.thresholds = normalize_threshold_args(args.thresholds, args.threshold)
     maybe_cache(args)
     hparams = load_hparams(Path(args.hparams_json))

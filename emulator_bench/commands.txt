@@ -15,7 +15,7 @@ conda run -n mldb python emulator_bench/launch_parallel_retrain.py \
   --gpus 0 \
   --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
   --hparams_json emulator_bench/default_hparams_paper.json \
-  --trials_per_gpu 3
+  --runs_per_gpu 3 \
   --seeds 666 777 888
 
 # Optional Optuna tuning.
