@@ -10,7 +10,13 @@ import numpy as np
 import pandas as pd
 import torch
 from torch.utils.data import DataLoader
-from tqdm.auto import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -64,7 +70,7 @@ def evaluate(model, loader, device, autocast_dtype, desc="eval", show_progress=F
     total_count = 0
     pred_log10_values = []
     true_log10_values = []
-    iterator = tqdm(loader, desc=desc, leave=False, unit="batch") if show_progress else loader
+    iterator = progress(loader, desc=desc, leave=False, unit="batch") if show_progress else loader
     with torch.no_grad():
         for batch in iterator:
             batch = _move_batch(batch, device)
@@ -87,7 +93,7 @@ def train_one_epoch(model, loader, optimizer, device, autocast_dtype, scaler, cl
     loss_fn = torch.nn.MSELoss(reduction="mean")
     total_loss = 0.0
     total_count = 0
-    iterator = tqdm(loader, desc="train", leave=False, unit="batch")
+    iterator = progress(loader, desc="train", leave=False, unit="batch")
     for batch in iterator:
         batch = _move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
@@ -243,7 +249,7 @@ def main():
     else:
         print(f"Device: {device} | precision: {precision_mode}", flush=True)
 
-    for epoch in tqdm(range(1, int(hparams["epochs"]) + 1), desc="epochs", unit="epoch"):
+    for epoch in progress(range(1, int(hparams["epochs"]) + 1), desc="epochs", unit="epoch"):
         if int(hparams["decay_interval"]) > 0 and epoch % int(hparams["decay_interval"]) == 0:
             optimizer.param_groups[0]["lr"] *= float(hparams["lr_decay"])
         train_metrics = train_one_epoch(

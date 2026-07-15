@@ -4,7 +4,13 @@ import time
 from pathlib import Path
 
 import pandas as pd
-from tqdm.auto import tqdm
+try:
+    from src.utils.rich_progress import progress, write
+except ModuleNotFoundError:
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
+    from src.utils.rich_progress import progress, write
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -93,7 +99,7 @@ def cache_features(args):
     excluded_smiles = set()
     molecules_written = 0
     molecules_reused = 0
-    for smiles in tqdm(smiles_values, desc="Caching DLKcat molecule features", unit="smiles"):
+    for smiles in progress(smiles_values, desc="Caching DLKcat molecule features", unit="smiles"):
         path = molecule_cache_path(cache_dir, smiles)
         if path.exists() and not args.overwrite:
             molecules_reused += 1
@@ -109,7 +115,7 @@ def cache_features(args):
 
     proteins_written = 0
     proteins_reused = 0
-    for sequence in tqdm(sequences, desc="Caching DLKcat protein n-grams", unit="seq"):
+    for sequence in progress(sequences, desc="Caching DLKcat protein n-grams", unit="seq"):
         path = protein_cache_path(cache_dir, sequence)
         if path.exists() and not args.overwrite:
             proteins_reused += 1
