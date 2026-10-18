@@ -26,7 +26,7 @@ Training uses `log2(value)`. Metrics and predictions are in `log10` space. As in
 
 ## Cache
 
-Features are cached once per unique SMILES and sequence in `outputs/baselines/DLKcat/embeddings/dlkcat_radius2_ngram3` (change with `--embeddings_dir`). Per-split manifests point rows to the cached features.
+Features are cached once per unique SMILES and sequence in `outputs/baselines/DLKcat/embeddings/dlkcat_v3_radius2_ngram3_<fingerprint>` (change with `--embeddings_dir`). Per-split manifests point rows to the cached features.
 
 Dictionary ids follow the original preprocessing. The original assigns atom, bond, fingerprint, edge and word ids in dataset row order, after it drops dotted SMILES and `value <= 0`. The wrapper does the same on the full, unsplit task table `<base_dir>/<task>_kinetic_params_1d.parquet` in stored row order. Items that only a split contains come after, sorted. The fingerprint dictionary depends on molecule order, so a different order gives a different table size and different initial weights. The cache folder name holds the cache version and a fingerprint of the table (`dlkcat_v2_radius2_ngram3_<fingerprint>`), so a changed table builds a new cache.
 
@@ -38,9 +38,11 @@ See `commands.txt`. The main command is:
 python emulator_bench/launch_parallel_retrain.py --gpus 0 1 2 3
 ```
 
-It builds the cache, then runs every discovered split with seeds 666, 777 and 888. Finished runs are skipped unless `--overwrite` is set. Results go to `outputs/baselines/DLKcat/results/<split_group>/<split_name>/seed_<seed>` (change with `--output_root`).
+`--gpus` lists the GPU ids. Each run gets one GPU through `CUDA_VISIBLE_DEVICES`, and `--runs_per_gpu N` sets how many runs share one GPU. For example, `--gpus 0 1 --runs_per_gpu 2` runs four at once. `--amp` turns on mixed precision (bf16 on Ampere or newer, fp16 with a GradScaler on older GPUs). The default is fp32, as in the original.
 
-Each run directory contains `model_state_dict.pth`, `logfile.csv`, `run_summary.json`, `final_results_{train,val,test}.csv` and `pred_label_{train,val,test}.csv`. `aggregate_dlkcat_results.py` writes mean and std over seeds.
+It builds the cache, then runs every discovered split with seeds 666, 777 and 888. Finished runs are skipped unless `--overwrite` is set. Results go to `outputs/baselines/DLKcat/<task>/<split_group>/<split_name>/seed_<seed>` (change with `--output_root`). Split groups without threshold folders use `all` as `<split_name>`.
+
+Each run directory contains `lastmodel.pth` (last epoch), `logfile.csv`, `run_summary.json`, `final_results_{train,val,test}.csv` and `pred_label_{train,val,test}.csv`. `aggregate_dlkcat_results.py` writes mean and std over seeds.
 
 ## Batch order
 

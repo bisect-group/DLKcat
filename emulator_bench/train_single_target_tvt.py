@@ -28,6 +28,7 @@ from emulator_bench.common import (
     hparams_cache_dir,
     load_hparams,
     regression_metrics,
+    resolve_amp_dtype,
     resolve_single_split_job,
     save_json,
     set_seed,
@@ -43,7 +44,11 @@ def _move_batch(batch, device):
     return {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
 
 
-def evaluate(model, loader, device, desc="eval", show_progress=False):
+def _autocast(device, amp_dtype):
+    return torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None)
+
+
+def evaluate(model, loader, device, amp_dtype=None, desc="eval", show_progress=False):
     model.eval()
     total_loss = 0.0
     pred_log10, true_log10 = [], []
@@ -51,7 +56,9 @@ def evaluate(model, loader, device, desc="eval", show_progress=False):
     with torch.no_grad():
         for batch in iterator:
             batch = _move_batch(batch, device)
-            pred_log2 = model(batch)
+            with _autocast(device, amp_dtype):
+                pred_log2 = model(batch)
+            pred_log2 = pred_log2.float()
             total_loss += float(torch.nn.functional.mse_loss(pred_log2, batch["target_log2"], reduction="sum"))
             pred_log10.append(pred_log2.cpu().numpy() * LOG10_OF_2)
             true_log10.append(batch["target_log10"].cpu().numpy())
@@ -61,16 +68,23 @@ def evaluate(model, loader, device, desc="eval", show_progress=False):
     return y_true, y_pred, metrics
 
 
-def train_one_epoch(model, loader, optimizer, device):
+def train_one_epoch(model, loader, optimizer, device, amp_dtype=None, scaler=None):
     model.train()
     total_loss = 0.0
     total_count = 0
     for batch in progress(loader, desc="train", leave=False, unit="batch"):
         batch = _move_batch(batch, device)
         optimizer.zero_grad(set_to_none=True)
-        loss = torch.nn.functional.mse_loss(model(batch), batch["target_log2"])
-        loss.backward()
-        optimizer.step()
+        with _autocast(device, amp_dtype):
+            pred_log2 = model(batch)
+        loss = torch.nn.functional.mse_loss(pred_log2.float(), batch["target_log2"])
+        if scaler is None:
+            loss.backward()
+            optimizer.step()
+        else:
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
         total_loss += float(loss.item()) * len(batch["target_log2"])
         total_count += len(batch["target_log2"])
     return {"loss": total_loss / total_count}
@@ -111,6 +125,7 @@ def main():
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--epochs", type=int, default=None, help="Smoke-test override of the original epoch count.")
     parser.add_argument("--num_workers", type=int, default=4)
+    parser.add_argument("--amp", action="store_true", help="Opt in to mixed precision (bf16 on Ampere or newer, else fp16). The original code trains in fp32.")
     args = parser.parse_args()
 
     hparams = load_hparams(Path(args.hparams_json))
@@ -118,6 +133,8 @@ def main():
         hparams["epochs"] = args.epochs
     set_seed(args.seed)
     device = torch.device(args.device)
+    amp_dtype, precision = resolve_amp_dtype(device) if args.amp else (None, "fp32")
+    scaler = torch.amp.GradScaler("cuda") if amp_dtype == torch.float16 else None
 
     cache_dir = hparams_cache_dir(hparams, args.embeddings_dir, args.base_dir)
     if not manifest_path(cache_dir).exists():
@@ -152,14 +169,14 @@ def main():
 
     started = time.time()
     started_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"Device: {device} | precision: fp32", flush=True)
+    print(f"Device: {device} | precision: {precision}", flush=True)
 
     for epoch in progress(range(1, int(hparams["epochs"]) + 1), desc="epochs", unit="epoch"):
         if epoch % int(hparams["decay_interval"]) == 0:
             optimizer.param_groups[0]["lr"] *= float(hparams["lr_decay"])
         np.random.shuffle(train_order)
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device)
-        _, _, val_metrics = evaluate(model, loaders["val"], device)
+        train_metrics = train_one_epoch(model, train_loader, optimizer, device, amp_dtype, scaler)
+        _, _, val_metrics = evaluate(model, loaders["val"], device, amp_dtype)
         append_csv_row(
             out_dir / "logfile.csv",
             {
@@ -170,11 +187,11 @@ def main():
                 "elapsed_seconds": time.time() - started,
             },
         )
-        torch.save(model.state_dict(), out_dir / "model_state_dict.pth")
+        torch.save(model.state_dict(), out_dir / "lastmodel.pth")
 
     final = {}
     for name in ("train", "val", "test"):
-        y_true, y_pred, metrics = evaluate(model, loaders[name], device, desc=f"final {name}", show_progress=True)
+        y_true, y_pred, metrics = evaluate(model, loaders[name], device, amp_dtype, desc=f"final {name}", show_progress=True)
         final[name] = metrics
         _save_predictions(out_dir / f"pred_label_{name}.csv", y_true, y_pred)
         _save_metrics(out_dir / f"final_results_{name}.csv", metrics)

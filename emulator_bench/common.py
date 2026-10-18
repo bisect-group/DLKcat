@@ -16,7 +16,7 @@ EMULATOR_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_BASE_DIR = EMULATOR_ROOT / "data" / "processed" / "datasets" / "kinetic_dataset" / "kcat"
 DEFAULT_WORK_DIR = EMULATOR_ROOT / "outputs" / "baselines" / "DLKcat"
 DEFAULT_EMBEDDINGS_DIR = DEFAULT_WORK_DIR / "embeddings"
-DEFAULT_OUTPUT_ROOT = DEFAULT_WORK_DIR / "results"
+DEFAULT_OUTPUT_ROOT = DEFAULT_WORK_DIR / DEFAULT_BASE_DIR.name
 DEFAULT_HPARAMS_PATH = REPO_ROOT / "emulator_bench" / "default_hparams_paper.json"
 DEFAULT_SEEDS = [666, 777, 888]
 DEFAULT_SPLIT_GROUPS = [
@@ -57,7 +57,7 @@ def load_hparams(path: Optional[Path] = None) -> Dict:
     return load_json(Path(path or DEFAULT_HPARAMS_PATH))
 
 
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 def task_table_inputs(base_dir: Path):
@@ -164,7 +164,7 @@ def discover_split_jobs(
             jobs.append(
                 {
                     "split_group": split_group,
-                    "split_name": split_group,
+                    "split_name": "all",
                     "difficulty": split_group,
                     "root_dir": str(group_dir),
                     "train_path": str(train_path),
@@ -225,6 +225,15 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
+
+
+def resolve_amp_dtype(device: torch.device):
+    """bf16 on Ampere or newer, fp16 on older GPUs, fp32 (None) on CPU."""
+    if device.type != "cuda":
+        return None, "fp32"
+    if torch.cuda.get_device_capability(device)[0] >= 8:
+        return torch.bfloat16, "bf16"
+    return torch.float16, "fp16"
 
 
 def regression_metrics(y_true_log10, y_pred_log10) -> Dict[str, float]:
