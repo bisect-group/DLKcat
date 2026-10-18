@@ -9,7 +9,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from emulator_bench.common import DEFAULT_BASE_DIR
+from emulator_bench.common import DEFAULT_OUTPUT_ROOT
 
 
 def _parse_run_identity(root: Path, run_dir: Path):
@@ -41,7 +41,7 @@ def collect_runs(root: Path):
         if summary_path.exists():
             with open(summary_path, "r") as handle:
                 summary = json.load(handle)
-            for key in ("task_name", "precision_mode", "best_epoch", "best_val_metric", "monitor_metric", "elapsed_seconds"):
+            for key in ("task_name", "epochs", "elapsed_seconds"):
                 if key in summary:
                     row[key] = summary[key]
 
@@ -72,7 +72,7 @@ def summarize_mean_std(runs: pd.DataFrame, group_cols):
 
 def main():
     parser = argparse.ArgumentParser(description="Aggregate DLKcat emulator_bench result directories.")
-    parser.add_argument("--root", type=str, default=str(Path(DEFAULT_BASE_DIR) / "retrain_paper_settings"))
+    parser.add_argument("--root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--out_dir", type=str, default=None)
     args = parser.parse_args()
     root = Path(args.root)

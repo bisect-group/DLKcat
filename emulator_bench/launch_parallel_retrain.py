@@ -14,17 +14,17 @@ if str(REPO_ROOT) not in sys.path:
 
 from emulator_bench.common import (
     DEFAULT_BASE_DIR,
+    DEFAULT_EMBEDDINGS_DIR,
     DEFAULT_HPARAMS_PATH,
-    DEFAULT_RETRAIN_DIRNAME,
+    DEFAULT_OUTPUT_ROOT,
+    DEFAULT_SEEDS,
     DEFAULT_SPLIT_GROUPS,
     discover_split_jobs,
     hparams_cache_dir,
     load_hparams,
-    normalize_threshold_args,
     summarize_seed_runs,
 )
 from emulator_bench.feature_pipeline import split_manifest_path
-
 
 CACHE_SCRIPT = REPO_ROOT / "emulator_bench" / "cache_embeddings.py"
 TRAIN_SCRIPT = REPO_ROOT / "emulator_bench" / "train_single_target_tvt.py"
@@ -40,42 +40,28 @@ def maybe_cache(args):
         args.base_dir,
         "--hparams_json",
         args.hparams_json,
+        "--embeddings_dir",
+        args.embeddings_dir,
         "--split_groups",
         *args.split_groups,
-        "--sequence_col",
-        args.sequence_col,
-        "--smiles_col",
-        args.smiles_col,
-        "--target_col",
-        args.target_col,
-        "--log10_col",
-        args.log10_col,
     ]
-    if args.embeddings_dir:
-        cmd.extend(["--embeddings_dir", args.embeddings_dir])
-    if args.thresholds:
-        cmd.extend(["--thresholds", *args.thresholds])
     if args.cache_overwrite:
         cmd.append("--overwrite")
     subprocess.run(cmd, check=True, cwd=str(REPO_ROOT))
 
 
 def build_experiments(args, jobs, cache_dir):
-    output_root = Path(args.output_root) if args.output_root else Path(args.base_dir) / DEFAULT_RETRAIN_DIRNAME
     experiments = []
     for job in jobs:
         for seed in args.seeds:
-            run_dir = output_root / job["split_group"] / job["split_name"] / f"seed_{seed}"
             experiments.append(
                 {
                     "split_group": job["split_group"],
                     "split_name": job["split_name"],
                     "difficulty": job["difficulty"],
                     "seed": int(seed),
-                    "run_dir": run_dir,
-                    "train_manifest": split_manifest_path(cache_dir, job["split_group"], job["split_name"], "train"),
-                    "val_manifest": split_manifest_path(cache_dir, job["split_group"], job["split_name"], "val"),
-                    "test_manifest": split_manifest_path(cache_dir, job["split_group"], job["split_name"], "test"),
+                    "run_dir": Path(args.output_root) / job["split_group"] / job["split_name"] / f"seed_{seed}",
+                    **{f"{split}_manifest": split_manifest_path(cache_dir, job["split_group"], job["split_name"], split) for split in ("train", "val", "test")},
                 }
             )
     return experiments
@@ -85,10 +71,10 @@ def train_command(args, exp, device):
     cmd = [
         sys.executable,
         str(TRAIN_SCRIPT),
-        "--base_dir",
-        args.base_dir,
         "--hparams_json",
         args.hparams_json,
+        "--embeddings_dir",
+        args.embeddings_dir,
         "--train_manifest",
         str(exp["train_manifest"]),
         "--val_manifest",
@@ -105,26 +91,19 @@ def train_command(args, exp, device):
         device,
         "--num_workers",
         str(args.num_workers),
-        "--prefetch_factor",
-        str(args.prefetch_factor),
     ]
-    if args.embeddings_dir:
-        cmd.extend(["--embeddings_dir", args.embeddings_dir])
-    if args.batch_size is not None:
-        cmd.extend(["--batch_size", str(args.batch_size)])
     if args.epochs is not None:
         cmd.extend(["--epochs", str(args.epochs)])
-    if args.pin_memory:
-        cmd.append("--pin_memory")
-    if args.persistent_workers:
-        cmd.append("--persistent_workers")
     return cmd
+
+
+def _result_identity(exp):
+    return {key: exp[key] for key in ("run_dir", "split_group", "split_name", "difficulty", "seed")}
 
 
 def run_experiment(args, exp, gpu_id):
     exp["run_dir"].mkdir(parents=True, exist_ok=True)
-    final_path = exp["run_dir"] / "final_results_test.csv"
-    if final_path.exists() and not args.overwrite:
+    if (exp["run_dir"] / "final_results_test.csv").exists() and not args.overwrite:
         return {"status": "skipped_exists", "gpu_id": str(gpu_id), **_result_identity(exp)}
     for key in ("train_manifest", "val_manifest", "test_manifest"):
         if not Path(exp[key]).exists():
@@ -134,16 +113,6 @@ def run_experiment(args, exp, gpu_id):
     device = "cuda:0" if args.device.startswith("cuda") else args.device
     subprocess.run(train_command(args, exp, device), check=True, cwd=str(REPO_ROOT), env=env)
     return {"status": "completed", "gpu_id": str(gpu_id), **_result_identity(exp)}
-
-
-def _result_identity(exp):
-    return {
-        "run_dir": str(exp["run_dir"]),
-        "split_group": exp["split_group"],
-        "split_name": exp["split_name"],
-        "difficulty": exp["difficulty"],
-        "seed": exp["seed"],
-    }
 
 
 def run_parallel(args, experiments):
@@ -166,7 +135,6 @@ def run_parallel(args, experiments):
                 result = {"status": "failed", "gpu_id": str(gpu_id), "slot_index": slot_index, "error": str(exc), **_result_identity(exp)}
             with result_lock:
                 results.append(result)
-            work_queue.task_done()
 
     threads = []
     for gpu_id in args.gpus:
@@ -199,53 +167,34 @@ def summarize(output_root: Path, results):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Retrain DLKcat split jobs in parallel using paper/default settings.")
-    parser.add_argument("--gpus", nargs="+", required=True)
-    parser.add_argument(
-        "--runs_per_gpu",
-        "--trials_per_gpu",
-        dest="runs_per_gpu",
-        type=int,
-        default=1,
-        help="Number of concurrent retrain worker processes to run per GPU.",
-    )
-    parser.add_argument("--base_dir", type=str, default=str(DEFAULT_BASE_DIR))
-    parser.add_argument("--embeddings_dir", type=str, default=None)
+    parser = argparse.ArgumentParser(description="Train DLKcat with its original settings on all discovered EMULaToR splits and seeds.")
+    parser.add_argument("--gpus", nargs="+", required=True, help="GPU ids; use any id with --device cpu.")
+    parser.add_argument("--runs_per_gpu", type=int, default=1, help="Concurrent training processes per GPU.")
+    parser.add_argument("--base_dir", type=str, default=str(DEFAULT_BASE_DIR), help="Task directory, e.g. data/processed/datasets/kinetic_dataset/kcat.")
+    parser.add_argument("--embeddings_dir", type=str, default=str(DEFAULT_EMBEDDINGS_DIR))
     parser.add_argument("--hparams_json", type=str, default=str(DEFAULT_HPARAMS_PATH))
-    parser.add_argument("--output_root", type=str, default=None)
+    parser.add_argument("--output_root", type=str, default=str(DEFAULT_OUTPUT_ROOT))
     parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
-    parser.add_argument("--threshold", type=str, default=None)
-    parser.add_argument("--thresholds", nargs="+", default=None)
-    parser.add_argument("--sequence_col", type=str, default="sequence")
-    parser.add_argument("--smiles_col", type=str, default="smiles")
-    parser.add_argument("--target_col", type=str, default="value")
-    parser.add_argument("--log10_col", type=str, default="log10_value")
-    parser.add_argument("--seeds", nargs="+", type=int, default=[666])
+    parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
     parser.add_argument("--device", type=str, default="cuda:0")
     parser.add_argument("--num_workers", type=int, default=4)
-    parser.add_argument("--prefetch_factor", type=int, default=4)
-    parser.add_argument("--persistent_workers", action="store_true")
-    parser.add_argument("--pin_memory", action="store_true")
     parser.add_argument("--skip_cache", action="store_true")
     parser.add_argument("--cache_overwrite", action="store_true")
     parser.add_argument("--overwrite", action="store_true")
-    parser.add_argument("--batch_size", type=int, default=None)
-    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--epochs", type=int, default=None, help="Smoke-test override of the original epoch count.")
     args = parser.parse_args()
 
-    if args.runs_per_gpu <= 0:
-        raise ValueError("--runs_per_gpu must be positive")
-    args.thresholds = normalize_threshold_args(args.thresholds, args.threshold)
     maybe_cache(args)
     hparams = load_hparams(Path(args.hparams_json))
-    cache_dir = hparams_cache_dir(Path(args.base_dir), hparams, Path(args.embeddings_dir) if args.embeddings_dir else None)
-    jobs = discover_split_jobs(Path(args.base_dir), split_groups=args.split_groups, thresholds=args.thresholds)
+    cache_dir = hparams_cache_dir(hparams, args.embeddings_dir, args.base_dir)
+    jobs = discover_split_jobs(Path(args.base_dir), split_groups=args.split_groups)
     if not jobs:
         raise FileNotFoundError(f"No split jobs found in {args.base_dir}")
-    experiments = build_experiments(args, jobs, cache_dir)
-    results = run_parallel(args, experiments)
-    output_root = Path(args.output_root) if args.output_root else Path(args.base_dir) / DEFAULT_RETRAIN_DIRNAME
-    summarize(output_root, results)
+    results = run_parallel(args, build_experiments(args, jobs, cache_dir))
+    summarize(Path(args.output_root), results)
+    failed = [result for result in results if result["status"] == "failed"]
+    if failed:
+        sys.exit("\n".join(f"FAILED {result['run_dir']}: {result['error']}" for result in failed))
 
 
 if __name__ == "__main__":

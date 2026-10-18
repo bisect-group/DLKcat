@@ -1,30 +1,21 @@
-# Build or reuse the paper-setting DLKcat feature cache.
-conda run -n mldb python emulator_bench/cache_embeddings.py \
-  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
-  --hparams_json emulator_bench/default_hparams_paper.json
+# Run from the DLKcat submodule root. Python: conda env mldb (PY=python after `conda activate mldb`).
+# Default paths: data in EMULaToR/data/processed/datasets/kinetic_dataset/kcat,
+# caches in EMULaToR/outputs/baselines/DLKcat/embeddings,
+# results in EMULaToR/outputs/baselines/DLKcat/results.
 
-# Train one split on cuda:0.
-conda run -n mldb python emulator_bench/train_single_target_tvt.py \
-  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
-  --hparams_json emulator_bench/default_hparams_paper.json \
+# Build the feature cache (the launcher also does this unless --skip_cache is set).
+$PY emulator_bench/cache_embeddings.py
+
+# Train all discovered splits x seeds 666 777 888 on GPUs 0-3, with original settings.
+$PY emulator_bench/launch_parallel_retrain.py \
+  --gpus 0 1 2 3 \
+  --runs_per_gpu 1
+
+# Train one split and one seed.
+$PY emulator_bench/train_single_target_tvt.py \
   --split_group random_splits_grouped_sequence \
+  --seed 666 \
   --device cuda:0
 
-# Retrain all requested split jobs in parallel using paper settings.
-conda run -n mldb python emulator_bench/launch_parallel_retrain.py \
-  --gpus 0 \
-  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
-  --hparams_json emulator_bench/default_hparams_paper.json \
-  --runs_per_gpu 3 \
-  --seeds 666 777 888
-
-# Optional Optuna tuning.
-conda run -n mldb python emulator_bench/tune_optuna.py \
-  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
-  --split_groups random_splits_grouped_sequence random_splits_grouped_smiles \
-  --device cuda:0 \
-  --n_trials 20
-
-# Aggregate paper-setting retrain outputs.
-conda run -n mldb python emulator_bench/aggregate_dlkcat_results.py \
-  --root /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat/retrain_paper_settings
+# Aggregate the outputs.
+$PY emulator_bench/aggregate_dlkcat_results.py

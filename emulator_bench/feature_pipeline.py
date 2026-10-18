@@ -141,8 +141,6 @@ def create_adjacency(mol) -> np.ndarray:
 
 def featurize_smiles(smiles: str, radius: int, dictionaries: Dict[str, Dict]) -> Dict[str, np.ndarray]:
     raw_smiles = str(smiles).strip()
-    if "." in raw_smiles:
-        raise ValueError(f"DLKcat preprocessing excludes multi-component SMILES containing '.': {raw_smiles}")
     mol = Chem.MolFromSmiles(raw_smiles)
     if mol is None:
         raise ValueError(f"RDKit could not parse SMILES: {raw_smiles}")
@@ -156,6 +154,8 @@ def featurize_smiles(smiles: str, radius: int, dictionaries: Dict[str, Dict]) ->
         dictionaries["fingerprint_dict"],
         dictionaries["edge_dict"],
     )
+    if len(fingerprints) != len(atoms):
+        raise ValueError(f"WL fingerprints do not cover all atoms (unbonded atoms): {raw_smiles}")
     adjacency = create_adjacency(mol)
     return {"fingerprints": fingerprints, "adjacency": adjacency, "num_atoms": np.asarray([len(fingerprints)], dtype=np.int64)}
 
@@ -224,16 +224,25 @@ def build_split_manifest(
     log10_col: str,
     source_path: Path,
     excluded_smiles=None,
+    is_train: bool = False,
 ) -> pd.DataFrame:
+    """Apply the original DLKcat filters ('.' in SMILES, value <= 0) to train only; val and test keep every featurizable row."""
     excluded_smiles = set(excluded_smiles or [])
     rows = []
     for idx, row in frame.reset_index(drop=True).iterrows():
         value = float(row[target_col])
         sequence = normalize_sequence(str(row[sequence_col]))
         smiles = str(row[smiles_col]).strip()
-        if not sequence or not smiles or "." in smiles or smiles in excluded_smiles or not math.isfinite(value) or value <= 0:
+        if not sequence or not smiles or smiles in excluded_smiles or not math.isfinite(value):
             continue
-        target_log10 = float(row[log10_col]) if log10_col in frame.columns and pd.notna(row[log10_col]) else math.log10(value)
+        if is_train and ("." in smiles or value <= 0):
+            continue
+        if log10_col in frame.columns and pd.notna(row[log10_col]):
+            target_log10 = float(row[log10_col])
+        elif value > 0:
+            target_log10 = math.log10(value)
+        else:
+            continue
         rows.append(
             {
                 "row_index": int(idx),
@@ -242,7 +251,7 @@ def build_split_manifest(
                 "smiles_key": smiles_key(smiles),
                 "sequence_key": sequence_key(sequence),
                 "target_value": value,
-                "target_log2": math.log2(value),
+                "target_log2": math.log2(value) if value > 0 else target_log10 / math.log10(2.0),
                 "target_log10": target_log10,
             }
         )

@@ -11,9 +11,5 @@
   "decay_interval": 10,
   "weight_decay": 0.000001,
   "epochs": 50,
-  "batch_size": 128,
-  "monitor_metric": "rmse",
-  "val_every": 1,
-  "patience": 0,
-  "clip_grad": 0.0
+  "batch_size": 1
 }

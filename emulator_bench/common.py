@@ -12,23 +12,20 @@ import torch
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_MODEL_NAME = "DLKcat"
-DEFAULT_BASE_DIR = Path(f"/home/adhil/github/EMULaToR/data/processed/baselines/{DEFAULT_MODEL_NAME}")
+EMULATOR_ROOT = Path(__file__).resolve().parents[3]
+DEFAULT_BASE_DIR = EMULATOR_ROOT / "data" / "processed" / "datasets" / "kinetic_dataset" / "kcat"
+DEFAULT_WORK_DIR = EMULATOR_ROOT / "outputs" / "baselines" / "DLKcat"
+DEFAULT_EMBEDDINGS_DIR = DEFAULT_WORK_DIR / "embeddings"
+DEFAULT_OUTPUT_ROOT = DEFAULT_WORK_DIR / "results"
 DEFAULT_HPARAMS_PATH = REPO_ROOT / "emulator_bench" / "default_hparams_paper.json"
-DEFAULT_RESULTS_DIRNAME = "dlkcat_results"
-DEFAULT_OPTUNA_RESULTS_DIRNAME = "dlkcat_optuna_runs"
-DEFAULT_RETRAIN_DIRNAME = "retrain_paper_settings"
+DEFAULT_SEEDS = [666, 777, 888]
 DEFAULT_SPLIT_GROUPS = [
     "random_splits_grouped_sequence",
     "random_splits_grouped_smiles",
     "uniprot_time_splits",
-    "substrate_splits",
     "enzyme_sequence_splits",
-    "enzyme_structure_splits",
-    "conformer_cosine_splits",
+    "substrate_splits",
 ]
-
-MINIMIZE_METRICS = {"rmse", "mse", "mae", "loss"}
 
 
 def stable_hash(text: str) -> str:
@@ -60,9 +57,29 @@ def load_hparams(path: Optional[Path] = None) -> Dict:
     return load_json(Path(path or DEFAULT_HPARAMS_PATH))
 
 
-def hparams_cache_dir(base_dir: Path, hparams: Dict, embeddings_dir: Optional[Path] = None) -> Path:
-    root = Path(embeddings_dir) if embeddings_dir is not None else Path(base_dir) / "embeddings"
-    return root / f"dlkcat_radius{int(hparams['radius'])}_ngram{int(hparams['ngram'])}"
+CACHE_VERSION = 2
+
+
+def task_table_inputs(base_dir: Path):
+    """SMILES and sequences of the full task table, in stored row order, after the original filters ('.' in SMILES, value <= 0).
+
+    The original assigns all dictionary ids in this order. Returns the two lists and a fingerprint of them.
+    """
+    base_dir = Path(base_dir)
+    frame = pd.read_parquet(base_dir / f"{base_dir.name}_kinetic_params_1d.parquet", columns=["smiles", "sequence", "value"])
+    frame = frame[frame["smiles"].notna() & frame["sequence"].notna()]
+    frame = frame[~frame["smiles"].astype(str).str.contains(".", regex=False) & (frame["value"].astype(float) > 0)]
+    smiles = frame["smiles"].astype(str).str.strip().tolist()
+    sequences = [normalize_sequence(value) for value in frame["sequence"]]
+    fingerprint = stable_hash("\n".join(f"{a}\t{b}" for a, b in zip(smiles, sequences)))[:12]
+    return smiles, sequences, fingerprint
+
+
+def hparams_cache_dir(hparams: Dict, embeddings_dir: Optional[Path], base_dir: Path) -> Path:
+    """The folder name holds the cache version and the task table fingerprint, so a changed table builds a new cache."""
+    root = Path(embeddings_dir or DEFAULT_EMBEDDINGS_DIR)
+    fingerprint = task_table_inputs(base_dir)[2]
+    return root / f"dlkcat_v{CACHE_VERSION}_radius{int(hparams['radius'])}_ngram{int(hparams['ngram'])}_{fingerprint}"
 
 
 def read_table(path: Path) -> pd.DataFrame:
@@ -208,19 +225,6 @@ def set_seed(seed: int) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-
-
-def resolve_amp_dtype(device: torch.device):
-    if device.type != "cuda":
-        return None, "fp32"
-    capability = torch.cuda.get_device_capability(device)
-    if capability[0] >= 8:
-        return torch.bfloat16, "bf16"
-    return torch.float16, "fp16"
-
-
-def metric_direction(metric: str) -> str:
-    return "minimize" if metric in MINIMIZE_METRICS else "maximize"
 
 
 def regression_metrics(y_true_log10, y_pred_log10) -> Dict[str, float]:

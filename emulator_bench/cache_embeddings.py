@@ -5,12 +5,12 @@ from pathlib import Path
 
 import pandas as pd
 try:
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 except ModuleNotFoundError:
     import sys
     from pathlib import Path
     sys.path.insert(0, str(Path(__file__).resolve().parents[3]))
-    from src.utils.rich_progress import progress, write
+    from src.utils.rich_progress import progress
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -18,19 +18,21 @@ if str(REPO_ROOT) not in sys.path:
 
 from emulator_bench.common import (
     DEFAULT_BASE_DIR,
+    DEFAULT_EMBEDDINGS_DIR,
     DEFAULT_HPARAMS_PATH,
     DEFAULT_SPLIT_GROUPS,
     discover_split_jobs,
+    CACHE_VERSION,
     hparams_cache_dir,
+    normalize_sequence,
+    task_table_inputs,
     load_hparams,
-    normalize_threshold_args,
     read_table,
     require_columns,
     save_json,
 )
 from emulator_bench.feature_pipeline import (
     build_split_manifest,
-    collect_unique_inputs,
     featurize_sequence,
     featurize_smiles,
     load_dictionaries,
@@ -43,6 +45,9 @@ from emulator_bench.feature_pipeline import (
     save_protein,
     split_manifest_path,
 )
+
+
+CACHE_BATCH = 2000
 
 
 def _limit_jobs_for_smoke(jobs, max_jobs):
@@ -60,7 +65,7 @@ def _read_split(path: Path, sample_rows: int = 0):
 
 def cache_features(args):
     hparams = load_hparams(Path(args.hparams_json))
-    cache_dir = hparams_cache_dir(Path(args.base_dir), hparams, Path(args.embeddings_dir) if args.embeddings_dir else None)
+    cache_dir = hparams_cache_dir(hparams, args.embeddings_dir, args.base_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     jobs = discover_split_jobs(Path(args.base_dir), split_groups=args.split_groups, thresholds=args.thresholds)
     jobs = _limit_jobs_for_smoke(jobs, args.max_jobs)
@@ -68,6 +73,8 @@ def cache_features(args):
         raise FileNotFoundError(f"No split jobs found in {args.base_dir}")
 
     started = time.time()
+    if args.overwrite:
+        manifest_path(cache_dir).unlink(missing_ok=True)
     dictionaries_file = cache_dir / "dictionaries.pkl"
     if dictionaries_file.exists() and not args.overwrite:
         dictionaries = load_dictionaries(cache_dir)
@@ -75,6 +82,7 @@ def cache_features(args):
     else:
         dictionaries = new_dictionaries()
 
+    table_smiles, table_sequences, table_fingerprint = task_table_inputs(args.base_dir)
     sequences = set()
     smiles_values = set()
     split_frames = {}
@@ -84,48 +92,56 @@ def cache_features(args):
             frame = _read_split(path, sample_rows=args.sample_rows)
             require_columns(frame, [args.sequence_col, args.smiles_col, args.target_col], path)
             split_frames[(job["split_group"], job["split_name"], split_name)] = (job, split_name, path, frame)
-            sequences.update(str(value) for value in frame[args.sequence_col].dropna().astype(str))
+            sequences.update(normalize_sequence(value) for value in frame[args.sequence_col].dropna().astype(str))
             for smiles in frame[args.smiles_col].dropna().astype(str):
-                value = str(smiles).strip()
-                if value and "." not in value:
+                value = smiles.strip()
+                if value and not (split_name == "train" and "." in value):
                     smiles_values.add(value)
 
-    sequences = sorted({sequence for sequence in sequences if str(sequence).strip()})
-    smiles_values = sorted(smiles_values)
+    # Ids follow the original: first occurrence in the full task table. Split-only items come after, sorted.
+    table_smiles = list(dict.fromkeys(table_smiles))
+    table_sequences = list(dict.fromkeys(table_sequences))
+    smiles_values = table_smiles + sorted(smiles_values.difference(table_smiles))
+    sequences = table_sequences + sorted(sequences.difference(table_sequences) - {""})
     print(f"Discovered {len(jobs)} split jobs")
     print(f"Unique sequences: {len(sequences)}")
-    print(f"Unique single-component SMILES: {len(smiles_values)}")
+    print(f"Unique SMILES: {len(smiles_values)}")
 
     excluded_smiles = set()
-    molecules_written = 0
     molecules_reused = 0
-    for smiles in progress(smiles_values, desc="Caching DLKcat molecule features", unit="smiles"):
-        path = molecule_cache_path(cache_dir, smiles)
-        if path.exists() and not args.overwrite:
+    pending_molecules = []
+    for smiles in smiles_values:
+        if molecule_cache_path(cache_dir, smiles).exists() and not args.overwrite:
             molecules_reused += 1
-            continue
-        try:
-            save_molecule(cache_dir, smiles, featurize_smiles(smiles, int(hparams["radius"]), dictionaries))
-            molecules_written += 1
-        except Exception as exc:
-            excluded_smiles.add(smiles)
-            if args.strict_smiles:
-                raise
-            print(f"Skipping SMILES `{smiles}`: {exc}")
+        else:
+            pending_molecules.append(smiles)
+    proteins_reused = sum(1 for sequence in sequences if protein_cache_path(cache_dir, sequence).exists() and not args.overwrite)
+    pending_sequences = [sequence for sequence in sequences if args.overwrite or not protein_cache_path(cache_dir, sequence).exists()]
 
-    proteins_written = 0
-    proteins_reused = 0
-    for sequence in progress(sequences, desc="Caching DLKcat protein n-grams", unit="seq"):
-        path = protein_cache_path(cache_dir, sequence)
-        if path.exists() and not args.overwrite:
-            proteins_reused += 1
-            continue
-        save_protein(cache_dir, sequence, featurize_sequence(sequence, int(hparams["ngram"]), dictionaries))
-        proteins_written += 1
+    def write_in_batches(items, desc, featurize, save, skip_failures=False):
+        """Featurize a batch, save the dictionaries, then write the batch files, so every file on disk has ids that the saved dictionaries contain."""
+        written = 0
+        for start in progress(range(0, len(items), CACHE_BATCH), desc=desc, unit="batch"):
+            payloads = []
+            for item in items[start : start + CACHE_BATCH]:
+                try:
+                    payloads.append((item, featurize(item)))
+                except Exception as exc:
+                    if not skip_failures or args.strict_smiles:
+                        raise
+                    excluded_smiles.add(item)
+                    print(f"Skipping SMILES `{item}`: {exc}")
+            save_dictionaries(cache_dir, dictionaries)
+            for item, payload in payloads:
+                save(cache_dir, item, payload)
+            written += len(payloads)
+        return written
 
+    radius, ngram = int(hparams["radius"]), int(hparams["ngram"])
+    molecules_written = write_in_batches(pending_molecules, "Caching DLKcat molecule features", lambda smiles: featurize_smiles(smiles, radius, dictionaries), save_molecule, skip_failures=True)
+    proteins_written = write_in_batches(pending_sequences, "Caching DLKcat protein n-grams", lambda sequence: featurize_sequence(sequence, ngram, dictionaries), save_protein)
     save_dictionaries(cache_dir, dictionaries)
 
-    manifest_rows = []
     split_rows = []
     for (split_group, split_job_name, split_name), (_job, _split_name, path, frame) in split_frames.items():
         split_manifest = build_split_manifest(
@@ -136,6 +152,7 @@ def cache_features(args):
             log10_col=args.log10_col,
             source_path=path,
             excluded_smiles=excluded_smiles,
+            is_train=split_name == "train",
         )
         out_path = split_manifest_path(cache_dir, split_group, split_job_name, split_name)
         out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -153,9 +170,14 @@ def cache_features(args):
             }
         )
 
-    pd.DataFrame(split_rows).to_csv(cache_dir / "split_manifest_index.csv", index=False)
+    index_path = cache_dir / "split_manifest_index.csv"
+    index = pd.DataFrame(split_rows)
+    if index_path.exists():
+        index = pd.concat([pd.read_csv(index_path), index]).drop_duplicates("manifest_path", keep="last")
+    index.to_csv(index_path, index=False)
     manifest = {
-        "cache_version": 1,
+        "cache_version": CACHE_VERSION,
+        "table_fingerprint": table_fingerprint,
         "base_dir": str(args.base_dir),
         "cache_dir": str(cache_dir),
         "hparams": hparams,
@@ -187,10 +209,9 @@ def cache_features(args):
 def main():
     parser = argparse.ArgumentParser(description="Cache DLKcat WL molecular features and protein n-gram features once for EMULaToR splits.")
     parser.add_argument("--base_dir", type=str, default=str(DEFAULT_BASE_DIR))
-    parser.add_argument("--embeddings_dir", type=str, default=None)
+    parser.add_argument("--embeddings_dir", type=str, default=str(DEFAULT_EMBEDDINGS_DIR))
     parser.add_argument("--hparams_json", type=str, default=str(DEFAULT_HPARAMS_PATH))
     parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
-    parser.add_argument("--threshold", type=str, default=None)
     parser.add_argument("--thresholds", nargs="+", default=None)
     parser.add_argument("--sequence_col", type=str, default="sequence")
     parser.add_argument("--smiles_col", type=str, default="smiles")
@@ -201,7 +222,6 @@ def main():
     parser.add_argument("--sample_rows", type=int, default=0, help="Smoke-test helper: use only this many rows per split.")
     parser.add_argument("--max_jobs", type=int, default=0, help="Smoke-test helper: use only this many discovered jobs.")
     args = parser.parse_args()
-    args.thresholds = normalize_threshold_args(args.thresholds, args.threshold)
     cache_features(args)
 
 

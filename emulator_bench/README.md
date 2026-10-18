@@ -1,98 +1,51 @@
 # DLKcat emulator_bench
 
-This bench adds EMULaToR split-driven retraining to DLKcat without changing the original `Code/` files.
+This wrapper trains DLKcat with its original published settings on the default EMULaToR kcat splits. It runs several seeds per split. It does not tune hyperparameters. The files in `Code/` are not changed.
 
-The default dataset path is:
+## Data
 
-`/home/adhil/github/EMULaToR/data/processed/baselines/DLKcat`
+Default task directory: `data/processed/datasets/kinetic_dataset/kcat` (pass another directory with `--base_dir`).
 
-The expected split files are parquet or CSV files with `smiles`, `sequence`, and `value`. When `log10_value` is present, it is used for reporting metrics.
+The wrapper trains on every split folder it finds:
 
-## Model Inputs
+- `random_splits_grouped_sequence`
+- `random_splits_grouped_smiles`
+- `uniprot_time_splits`
+- `enzyme_sequence_splits/threshold_<t>`
+- `substrate_splits/threshold_<t>`
 
-DLKcat uses:
+Each folder has `train`, `val` and `test` files (parquet or CSV) with the columns `sequence`, `smiles`, `value` and `log10_value`. The wrapper never writes into the data directory.
 
-- Substrate SMILES converted by RDKit into a hydrogen-expanded molecular graph.
-- Weisfeiler-Lehman r-radius molecular fingerprints from the original DLKcat preprocessing.
-- Protein sequences split into overlapping amino-acid n-grams.
-- kcat targets trained as `log2(value)`, matching the original DLKcat training script.
+## Model and settings
 
-Metrics and prediction CSVs are reported in `log10(value)` space for EMULaToR comparison.
+DLKcat uses WL r-radius fingerprints of the hydrogen-expanded molecular graph and overlapping 3-gram protein words. A GNN encodes the molecule. An attention CNN encodes the protein. Output layers predict `log2(kcat)`.
 
-## Cache Layout
+Settings are in `default_hparams_paper.json`. They follow the released training script `Code/model/run_model.py`: Adam, lr 1e-3, lr x0.5 every 10 epochs, weight decay 1e-6, 50 epochs, batch size 1 (one update per sample), dim 20, radius 2, 3-gram, 3 GNN, CNN and output layers, window 11, fp32. The model after the last epoch is evaluated. The original has no early stopping and no best-checkpoint rule.
 
-Feature caches are stored by default under:
+Training uses `log2(value)`. Metrics and predictions are in `log10` space. As in the original preprocessing, train rows with `.` in the SMILES or `value <= 0` are dropped. Val and test rows are kept if the model can featurize them. Rows that cannot be featurized are dropped, and `run_summary.json` (`rows_dropped`) counts them per split.
 
-`/home/adhil/github/EMULaToR/data/processed/baselines/DLKcat/embeddings/dlkcat_radius2_ngram3`
+## Cache
 
-The cache contains:
+Features are cached once per unique SMILES and sequence in `outputs/baselines/DLKcat/embeddings/dlkcat_radius2_ngram3` (change with `--embeddings_dir`). Per-split manifests point rows to the cached features.
 
-- `dictionaries.pkl`: DLKcat atom, bond, edge, fingerprint, and protein word dictionaries.
-- `molecules/<hash-prefix>/<hash>.npz`: one cached molecular fingerprint and adjacency per unique single-component SMILES.
-- `proteins/<hash-prefix>/<hash>.npz`: one cached n-gram sequence array per unique normalized protein sequence.
-- `split_manifests/.../{train,val,test}.csv`: row manifests pointing split rows to cached features and targets.
-- `manifest.json`: cache metadata.
+Dictionary ids follow the original preprocessing. The original assigns atom, bond, fingerprint, edge and word ids in dataset row order, after it drops dotted SMILES and `value <= 0`. The wrapper does the same on the full, unsplit task table `<base_dir>/<task>_kinetic_params_1d.parquet` in stored row order. Items that only a split contains come after, sorted. The fingerprint dictionary depends on molecule order, so a different order gives a different table size and different initial weights. The cache folder name holds the cache version and a fingerprint of the table (`dlkcat_v2_radius2_ngram3_<fingerprint>`), so a changed table builds a new cache.
 
-Repeated paper retraining, Optuna trials, and multi-GPU retraining reuse the same cache unless `--overwrite` is passed to `cache_embeddings.py`.
+## Commands
 
-DLKcat’s original preprocessing excluded SMILES containing `.`. This bench preserves that behavior and records skipped rows in split manifest counts.
-
-## Main Paper-Settings Workflow
-
-Use conda env `mldb`.
+See `commands.txt`. The main command is:
 
 ```bash
-conda run -n mldb python emulator_bench/cache_embeddings.py \
-  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
-  --hparams_json emulator_bench/default_hparams_paper.json
+python emulator_bench/launch_parallel_retrain.py --gpus 0 1 2 3
 ```
 
-```bash
-conda run -n mldb python emulator_bench/launch_parallel_retrain.py \
-  --gpus 0 1 2 3 \
-  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
-  --hparams_json emulator_bench/default_hparams_paper.json \
-  --seeds 666 667 668
-```
+It builds the cache, then runs every discovered split with seeds 666, 777 and 888. Finished runs are skipped unless `--overwrite` is set. Results go to `outputs/baselines/DLKcat/results/<split_group>/<split_name>/seed_<seed>` (change with `--output_root`).
 
-Single split training:
+Each run directory contains `model_state_dict.pth`, `logfile.csv`, `run_summary.json`, `final_results_{train,val,test}.csv` and `pred_label_{train,val,test}.csv`. `aggregate_dlkcat_results.py` writes mean and std over seeds.
 
-```bash
-conda run -n mldb python emulator_bench/train_single_target_tvt.py \
-  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
-  --hparams_json emulator_bench/default_hparams_paper.json \
-  --split_group random_splits_grouped_sequence \
-  --device cuda:0
-```
+## Batch order
 
-## Optional Optuna
+The original shuffles the train list in place with `np.random.shuffle` at the start of every epoch, after the lr decay. The wrapper does the same on an index array that the train loader reads, after `set_seed` seeds NumPy. The same seed gives the same batch order as the original.
 
-Optuna tunes retraining-safe optimization/runtime parameters only. It does not tune the DLKcat architecture, feature settings, target transform, or split definitions.
+## Speed
 
-```bash
-conda run -n mldb python emulator_bench/tune_optuna.py \
-  --base_dir /home/adhil/github/EMULaToR/data/processed/baselines/DLKcat \
-  --split_groups random_splits_grouped_sequence random_splits_grouped_smiles \
-  --device cuda:0 \
-  --n_trials 20
-```
-
-## Outputs
-
-Each run directory contains:
-
-- `bestmodel.pth`
-- `bestmodel_state_dict.pth`
-- `checkpoint_last.pt`
-- `logfile.csv`
-- `run_summary.json`
-- `final_results_train.csv`, `final_results_val.csv`, `final_results_test.csv`
-- `pred_label_train.csv`, `pred_label_val.csv`, `pred_label_test.csv`
-
-## Speed Enhancements
-
-- One-time reusable DLKcat feature caches.
-- Batched PyTorch 2.x implementation of the original DLKcat equations.
-- Automatic mixed precision: bf16 on Ampere-or-newer CUDA devices, otherwise fp16 with `GradScaler`.
-- TF32 enabled for CUDA matmul and cuDNN.
-- Multi-GPU parallel retraining launcher using paper settings by default.
+Batch size 1 is slow: expect hours per run on one GPU. The only speed-ups are the feature cache and DataLoader workers. They do not change the model or the training settings. The cache keeps the original dictionary order (see Cache).
