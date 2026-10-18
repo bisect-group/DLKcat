@@ -90,7 +90,7 @@ Timing (1000 train + 1000 val rows, GPU, batch size 1): about 23 s per epoch, so
 - Last-epoch checkpoint (no validation selection) follows the original code. The paper text says "validation-based checkpointing is kept when the original has it". The original has none.
 - Enzyme-structure and conformer splits do not exist on disk, so P-struct and Mol-3D have no DLKcat runs.
 - The five-fold files in the original repo were removed upstream, so the 50-epoch value comes from result file names in Code/analysis.
-- Dotted-SMILES val/test rows are dropped as not featurizable (counted in `rows_dropped`). Finished-run skip ignores `--epochs`: use a separate output root for smoke runs.
+- Dotted-SMILES val/test rows are dropped as not featurizable (counted in `rows_dropped`). The launcher skips a finished run only when its `run_summary.json` epochs match the requested epochs; otherwise it reruns the run.
 
 ## Equivalence check against the original (kcat, 64/16/16 rows, seed 666, 3 epochs, CPU)
 Wrapper CLI (`cache_embeddings.py`, `train_single_target_tvt.py`) against the original `preprocess_all.py` and `run_model.py` functions, on the same rows. Scratch table = train, val, test rows in the original order. Results: all five dictionaries identical (fingerprint 715, word 7369, atom 11, bond 4, edge 1463), initial weights max abs diff 0.0, batch order equal for all 3 epochs, final weights max abs diff 0.0, per-epoch val MAE/RMSE/R2 within 2e-8, train loss (mean x 64 against the original sum) within 4e-7 relative, final predictions within 8e-8 (log10). The original needed two NumPy 2 shims (ragged `np.save`, `math.pow` on size-1 arrays).

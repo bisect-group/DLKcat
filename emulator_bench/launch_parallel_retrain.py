@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import queue
 import subprocess
@@ -103,9 +104,14 @@ def _result_identity(exp):
     return {key: exp[key] for key in ("run_dir", "split_group", "split_name", "difficulty", "seed")}
 
 
+def _finished_with_epochs(run_dir: Path, epochs: int) -> bool:
+    summary_path = run_dir / "run_summary.json"
+    return (run_dir / "final_results_test.csv").exists() and summary_path.exists() and json.loads(summary_path.read_text())["epochs"] == epochs
+
+
 def run_experiment(args, exp, gpu_id):
     exp["run_dir"].mkdir(parents=True, exist_ok=True)
-    if (exp["run_dir"] / "final_results_test.csv").exists() and not args.overwrite:
+    if _finished_with_epochs(exp["run_dir"], args.effective_epochs) and not args.overwrite:
         return {"status": "skipped_exists", "gpu_id": str(gpu_id), **_result_identity(exp)}
     for key in ("train_manifest", "val_manifest", "test_manifest"):
         if not Path(exp[key]).exists():
@@ -189,6 +195,7 @@ def main():
 
     maybe_cache(args)
     hparams = load_hparams(Path(args.hparams_json))
+    args.effective_epochs = args.epochs if args.epochs is not None else int(hparams["epochs"])
     cache_dir = hparams_cache_dir(hparams, args.embeddings_dir, args.base_dir)
     jobs = discover_split_jobs(Path(args.base_dir), split_groups=args.split_groups)
     if not jobs:
