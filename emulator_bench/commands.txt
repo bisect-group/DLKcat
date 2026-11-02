@@ -11,11 +11,12 @@ $PY emulator_bench/launch_parallel_retrain.py \
   --gpus 0 1 2 3 \
   --runs_per_gpu 1
 
-# Same, on GPUs 0 and 1 with two runs per GPU and mixed precision (bf16 on Ampere or newer).
-$PY emulator_bench/launch_parallel_retrain.py \
-  --gpus 0 1 \
-  --runs_per_gpu 2 \
-  --amp
+# All 21 runs at once on one GPU. Start CUDA MPS first so the processes overlap on the GPU (about 2.5x faster than time slicing):
+export CUDA_MPS_PIPE_DIRECTORY=$HOME/mps CUDA_MPS_LOG_DIRECTORY=$HOME/mps/log
+mkdir -p $CUDA_MPS_PIPE_DIRECTORY $CUDA_MPS_LOG_DIRECTORY
+nvidia-cuda-mps-control -d
+OMP_NUM_THREADS=1 MKL_NUM_THREADS=1 $PY emulator_bench/launch_parallel_retrain.py --gpus 0 --runs_per_gpu 21
+# Stop MPS afterwards: echo quit | nvidia-cuda-mps-control
 
 # Train one split and one seed.
 $PY emulator_bench/train_single_target_tvt.py \
@@ -25,3 +26,6 @@ $PY emulator_bench/train_single_target_tvt.py \
 
 # Aggregate the outputs.
 $PY emulator_bench/aggregate_dlkcat_results.py
+
+# Equivalence check against the original code (CPU). Add --gpu for the CUDA test or --negative-control.
+bash emulator_bench/verify_equivalence.sh

@@ -90,8 +90,6 @@ def train_command(args, exp, device):
         str(exp["seed"]),
         "--device",
         device,
-        "--num_workers",
-        str(args.num_workers),
     ]
     if args.epochs is not None:
         cmd.extend(["--epochs", str(args.epochs)])
@@ -185,7 +183,6 @@ def main():
     parser.add_argument("--split_groups", nargs="+", default=DEFAULT_SPLIT_GROUPS)
     parser.add_argument("--seeds", nargs="+", type=int, default=DEFAULT_SEEDS)
     parser.add_argument("--device", type=str, default="cuda:0")
-    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--amp", action="store_true", help="Opt in to mixed precision (bf16 on Ampere or newer, else fp16). The original code trains in fp32.")
     parser.add_argument("--skip_cache", action="store_true")
     parser.add_argument("--cache_overwrite", action="store_true")

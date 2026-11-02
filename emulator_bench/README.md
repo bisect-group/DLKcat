@@ -22,7 +22,9 @@ DLKcat uses WL r-radius fingerprints of the hydrogen-expanded molecular graph an
 
 Settings are in `default_hparams_paper.json`. They follow the released training script `Code/model/run_model.py`: Adam, lr 1e-3, lr x0.5 every 10 epochs, weight decay 1e-6, 50 epochs, batch size 1 (one update per sample), dim 20, radius 2, 3-gram, 3 GNN, CNN and output layers, window 11, fp32. The model after the last epoch is evaluated. The original has no early stopping and no best-checkpoint rule.
 
-Training uses `log2(value)`. Metrics and predictions are in `log10` space. As in the original preprocessing, train rows with `.` in the SMILES or `value <= 0` are dropped. Val and test rows are kept if the model can featurize them. Rows that cannot be featurized are dropped, and `run_summary.json` (`rows_dropped`) counts them per split.
+Training uses `log2(value)`. Metrics and predictions are in `log10` space. As in the original preprocessing, train rows with `.` in the SMILES or `value <= 0` are dropped. Val and test rows are kept if the model can featurize them. Unbonded fragments in dotted SMILES (lone ions or atoms such as `[Mg+2]`) get an empty neighbour entry, so each atom gets one fingerprint, as in the DeepEnzyme wrapper. At prediction time, fingerprints, edges, atoms and bonds that the frozen dictionaries do not hold map to id 0. Rows that still cannot be featurized are dropped, and `run_summary.json` (`rows_dropped`) counts them per split.
+
+`rescore_repaired_test.py --cache_dir <cache>` rescored the finished runs on the full test split with the saved last-epoch models. Kept rows keep their stored predictions. Old files are `*_pre_repair.csv`, and `test_rescore_report.json` holds the counts.
 
 ## Cache
 
@@ -46,8 +48,17 @@ Each run directory contains `lastmodel.pth` (last epoch), `logfile.csv`, `run_su
 
 ## Batch order
 
-The original shuffles the train list in place with `np.random.shuffle` at the start of every epoch, after the lr decay. The wrapper does the same on an index array that the train loader reads, after `set_seed` seeds NumPy. The same seed gives the same batch order as the original.
+The original shuffles the train list in place with `np.random.shuffle` at the start of every epoch, after the lr decay. The wrapper does the same on a persistent index array after `set_seed` seeds NumPy. The same seed gives the same batch order as the original.
+
 
 ## Speed
 
-Batch size 1 is slow: expect hours per run on one GPU. The only speed-ups are the feature cache and DataLoader workers. They do not change the model or the training settings. The cache keeps the original dictionary order (see Cache).
+Batch size 1 means one tiny GPU step per sample, so a run is bound by kernel launches. These speed-ups keep the computation of the original:
+
+- The network runs one sample at a time with the original equations (no padding or masks).
+- Each split is loaded once onto the GPU. There is no DataLoader and no per-step host sync.
+- Features are cached once per unique SMILES and sequence.
+- Several runs share one GPU. A single process uses about half of the GPU time, and two or more processes overlap. Time slicing between processes gives only about 2x. CUDA MPS gives about 5x with 8 runs and about 5.3x with 21 runs. Start the MPS daemon first (see `commands.txt`).
+
+`--amp` is slower at batch size 1 (bf16: 94 s per epoch, fp32: 70 s), so the default stays fp32.
+A run saves `checkpoint_last.pt` after every epoch and resumes from it when started again.

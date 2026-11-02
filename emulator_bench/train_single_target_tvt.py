@@ -8,7 +8,6 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import torch
-from torch.utils.data import DataLoader
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
@@ -33,51 +32,42 @@ from emulator_bench.common import (
     save_json,
     set_seed,
 )
-from emulator_bench.dataset import DLKcatCachedDataset, dlkcat_collate
+from emulator_bench.dataset import PreloadedSplit
 from emulator_bench.feature_pipeline import load_dictionaries, manifest_path, split_manifest_path
 from emulator_bench.modeling import build_model
 
 LOG10_OF_2 = math.log10(2.0)
 
 
-def _move_batch(batch, device):
-    return {key: value.to(device) if torch.is_tensor(value) else value for key, value in batch.items()}
-
-
 def _autocast(device, amp_dtype):
     return torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_dtype is not None)
 
 
-def evaluate(model, loader, device, amp_dtype=None, desc="eval", show_progress=False):
+def evaluate(model, split, device, amp_dtype=None):
     model.eval()
-    total_loss = 0.0
-    pred_log10, true_log10 = [], []
-    iterator = progress(loader, desc=desc, leave=False, unit="batch") if show_progress else loader
     with torch.no_grad():
-        for batch in iterator:
-            batch = _move_batch(batch, device)
+        preds = []
+        for fingerprints, adjacency, words, _target in split.samples:
             with _autocast(device, amp_dtype):
-                pred_log2 = model(batch)
-            pred_log2 = pred_log2.float()
-            total_loss += float(torch.nn.functional.mse_loss(pred_log2, batch["target_log2"], reduction="sum"))
-            pred_log10.append(pred_log2.cpu().numpy() * LOG10_OF_2)
-            true_log10.append(batch["target_log10"].cpu().numpy())
-    y_pred, y_true = np.concatenate(pred_log10), np.concatenate(true_log10)
+                preds.append(model(fingerprints, adjacency, words))
+    pred_log2 = torch.cat(preds).view(-1).float()
+    target_log2 = torch.cat([sample[3] for sample in split.samples]).view(-1)
+    loss = float(torch.nn.functional.mse_loss(pred_log2, target_log2, reduction="sum")) / len(split)
+    y_pred, y_true = pred_log2.cpu().numpy() * LOG10_OF_2, split.target_log10
     metrics = regression_metrics(y_true, y_pred)
-    metrics["loss"] = total_loss / len(y_true)
+    metrics["loss"] = loss
     return y_true, y_pred, metrics
 
 
-def train_one_epoch(model, loader, optimizer, device, amp_dtype=None, scaler=None):
+def train_one_epoch(model, split, order, optimizer, device, amp_dtype=None, scaler=None):
     model.train()
-    total_loss = 0.0
-    total_count = 0
-    for batch in progress(loader, desc="train", leave=False, unit="batch"):
-        batch = _move_batch(batch, device)
+    total_loss = torch.zeros((), device=device)
+    for index in order:
+        fingerprints, adjacency, words, target = split.samples[index]
         optimizer.zero_grad(set_to_none=True)
         with _autocast(device, amp_dtype):
-            pred_log2 = model(batch)
-        loss = torch.nn.functional.mse_loss(pred_log2.float(), batch["target_log2"])
+            pred_log2 = model(fingerprints, adjacency, words)
+        loss = torch.nn.functional.mse_loss(pred_log2.float(), target)
         if scaler is None:
             loss.backward()
             optimizer.step()
@@ -85,9 +75,8 @@ def train_one_epoch(model, loader, optimizer, device, amp_dtype=None, scaler=Non
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
-        total_loss += float(loss.item()) * len(batch["target_log2"])
-        total_count += len(batch["target_log2"])
-    return {"loss": total_loss / total_count}
+        total_loss += loss.detach()
+    return {"loss": float(total_loss) / len(order)}
 
 
 def _resolve_manifest_paths(args, cache_dir):
@@ -124,7 +113,6 @@ def main():
     parser.add_argument("--seed", type=int, default=666)
     parser.add_argument("--device", type=str, default="cuda:0" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--epochs", type=int, default=None, help="Smoke-test override of the original epoch count.")
-    parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--amp", action="store_true", help="Opt in to mixed precision (bf16 on Ampere or newer, else fp16). The original code trains in fp32.")
     args = parser.parse_args()
 
@@ -141,7 +129,9 @@ def main():
         raise FileNotFoundError(f"Missing cache manifest {manifest_path(cache_dir)}. Run cache_embeddings.py first.")
     train_manifest, val_manifest, test_manifest, out_dir = _resolve_manifest_paths(args, cache_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "logfile.csv").unlink(missing_ok=True)
+    checkpoint = out_dir / "checkpoint_last.pt"
+    if not checkpoint.exists():
+        (out_dir / "logfile.csv").unlink(missing_ok=True)
 
     index = pd.read_csv(cache_dir / "split_manifest_index.csv")
     index = index.set_index(index["manifest_path"].map(lambda value: str(Path(value).resolve())))
@@ -154,29 +144,38 @@ def main():
     dictionaries = load_dictionaries(cache_dir)
     n_fingerprint = len(dictionaries["fingerprint_dict"])
     n_word = len(dictionaries["word_dict"])
-    datasets = {name: DLKcatCachedDataset(path, cache_dir) for name, path in (("train", train_manifest), ("val", val_manifest), ("test", test_manifest))}
-    if min(len(dataset) for dataset in datasets.values()) == 0:
+    store = {}
+    splits = {name: PreloadedSplit(path, cache_dir, device, store) for name, path in manifests.items()}
+    if min(len(split) for split in splits.values()) == 0:
         raise ValueError("Train/val/test manifests must all contain at least one row after DLKcat filtering.")
+    if int(hparams["batch_size"]) != 1:
+        raise ValueError("DLKcat trains with batch size 1.")
 
-    loader_kwargs = {"batch_size": int(hparams["batch_size"]), "num_workers": args.num_workers, "collate_fn": dlkcat_collate}
-    # The original shuffles the train list in place with np.random each epoch; the loader reads this order.
-    train_order = np.arange(len(datasets["train"]))
-    train_loader = DataLoader(datasets["train"], sampler=train_order, **loader_kwargs)
-    loaders = {name: DataLoader(dataset, shuffle=False, **loader_kwargs) for name, dataset in datasets.items()}
-
+    # The original shuffles the train list in place with np.random each epoch.
+    train_order = np.arange(len(splits["train"]))
     model = build_model(hparams, n_fingerprint=n_fingerprint, n_word=n_word).to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=float(hparams["lr"]), weight_decay=float(hparams["weight_decay"]))
 
-    started = time.time()
+    start_epoch, elapsed_before = 1, 0.0
+    if checkpoint.exists():
+        state = torch.load(checkpoint, map_location=device, weights_only=False)
+        model.load_state_dict(state["model"])
+        optimizer.load_state_dict(state["optimizer"])
+        train_order[:] = state["train_order"]
+        np.random.set_state(state["np_random_state"])
+        start_epoch, elapsed_before = state["epoch"] + 1, state["elapsed"]
+        print(f"Resuming from epoch {start_epoch}", flush=True)
+
+    started = time.time() - elapsed_before
     started_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"Device: {device} | precision: {precision}", flush=True)
 
-    for epoch in progress(range(1, int(hparams["epochs"]) + 1), desc="epochs", unit="epoch"):
+    for epoch in progress(range(start_epoch, int(hparams["epochs"]) + 1), desc="epochs", unit="epoch"):
         if epoch % int(hparams["decay_interval"]) == 0:
             optimizer.param_groups[0]["lr"] *= float(hparams["lr_decay"])
         np.random.shuffle(train_order)
-        train_metrics = train_one_epoch(model, train_loader, optimizer, device, amp_dtype, scaler)
-        _, _, val_metrics = evaluate(model, loaders["val"], device, amp_dtype)
+        train_metrics = train_one_epoch(model, splits["train"], train_order, optimizer, device, amp_dtype, scaler)
+        _, _, val_metrics = evaluate(model, splits["val"], device, amp_dtype)
         append_csv_row(
             out_dir / "logfile.csv",
             {
@@ -188,10 +187,14 @@ def main():
             },
         )
         torch.save(model.state_dict(), out_dir / "lastmodel.pth")
+        state = {"epoch": epoch, "model": model.state_dict(), "optimizer": optimizer.state_dict(), "train_order": train_order,
+                 "np_random_state": np.random.get_state(), "elapsed": time.time() - started}
+        torch.save(state, checkpoint.with_suffix(".tmp"))
+        checkpoint.with_suffix(".tmp").replace(checkpoint)
 
     final = {}
     for name in ("train", "val", "test"):
-        y_true, y_pred, metrics = evaluate(model, loaders[name], device, amp_dtype, desc=f"final {name}", show_progress=True)
+        y_true, y_pred, metrics = evaluate(model, splits[name], device, amp_dtype)
         final[name] = metrics
         _save_predictions(out_dir / f"pred_label_{name}.csv", y_true, y_pred)
         _save_metrics(out_dir / f"final_results_{name}.csv", metrics)

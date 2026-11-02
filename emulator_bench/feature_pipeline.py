@@ -91,27 +91,35 @@ def split_sequence(sequence: str, ngram: int, word_dict: Dict) -> np.ndarray:
     return np.asarray([word_dict[sequence[i : i + ngram]] for i in range(len(sequence) - ngram + 1)], dtype=np.int64)
 
 
+def _id(dictionary: Dict, key) -> int:
+    """Growing dictionaries add new keys; frozen plain dictionaries map unseen keys to id 0."""
+    return dictionary[key] if isinstance(dictionary, defaultdict) else dictionary.get(key, 0)
+
+
 def create_atoms(mol, atom_dict: Dict) -> np.ndarray:
     atoms = [atom.GetSymbol() for atom in mol.GetAtoms()]
     for atom in mol.GetAromaticAtoms():
         idx = atom.GetIdx()
         atoms[idx] = (atoms[idx], "aromatic")
-    return np.asarray([atom_dict[atom] for atom in atoms], dtype=np.int64)
+    return np.asarray([_id(atom_dict, atom) for atom in atoms], dtype=np.int64)
 
 
 def create_ijbonddict(mol, bond_dict: Dict):
     i_jbond_dict = defaultdict(lambda: [])
     for bond in mol.GetBonds():
         i, j = bond.GetBeginAtomIdx(), bond.GetEndAtomIdx()
-        bond_id = bond_dict[str(bond.GetBondType())]
+        bond_id = _id(bond_dict, str(bond.GetBondType()))
         i_jbond_dict[i].append((j, bond_id))
         i_jbond_dict[j].append((i, bond_id))
+    if len(i_jbond_dict) < mol.GetNumAtoms():
+        # Unbonded atoms (lone ions) get an empty entry, and all entries follow the atom index.
+        i_jbond_dict = {i: i_jbond_dict.get(i, []) for i in range(mol.GetNumAtoms())}
     return i_jbond_dict
 
 
 def extract_fingerprints(atoms: np.ndarray, i_jbond_dict, radius: int, fingerprint_dict: Dict, edge_dict: Dict) -> np.ndarray:
     if len(atoms) == 1 or radius == 0:
-        fingerprints = [fingerprint_dict[int(atom)] for atom in atoms]
+        fingerprints = [_id(fingerprint_dict, int(atom)) for atom in atoms]
         return np.asarray(fingerprints, dtype=np.int64)
 
     nodes = atoms.tolist()
@@ -122,14 +130,15 @@ def extract_fingerprints(atoms: np.ndarray, i_jbond_dict, radius: int, fingerpri
         for i, j_edge in i_jedge_dict.items():
             neighbors = [(nodes[j], edge) for j, edge in j_edge]
             fingerprint = (nodes[i], tuple(sorted(neighbors)))
-            fingerprints.append(fingerprint_dict[fingerprint])
+            fingerprints.append(_id(fingerprint_dict, fingerprint))
         nodes = fingerprints
 
         next_i_jedge_dict = defaultdict(lambda: [])
         for i, j_edge in i_jedge_dict.items():
+            next_i_jedge_dict[i]
             for j, edge in j_edge:
                 both_side = tuple(sorted((nodes[i], nodes[j])))
-                edge_id = edge_dict[(both_side, edge)]
+                edge_id = _id(edge_dict, (both_side, edge))
                 next_i_jedge_dict[i].append((j, edge_id))
         i_jedge_dict = next_i_jedge_dict
     return np.asarray(fingerprints, dtype=np.int64)
@@ -154,8 +163,6 @@ def featurize_smiles(smiles: str, radius: int, dictionaries: Dict[str, Dict]) ->
         dictionaries["fingerprint_dict"],
         dictionaries["edge_dict"],
     )
-    if len(fingerprints) != len(atoms):
-        raise ValueError(f"WL fingerprints do not cover all atoms (unbonded atoms): {raw_smiles}")
     adjacency = create_adjacency(mol)
     return {"fingerprints": fingerprints, "adjacency": adjacency, "num_atoms": np.asarray([len(fingerprints)], dtype=np.int64)}
 
